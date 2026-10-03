@@ -1,0 +1,9 @@
+.env
+.env.*
+**/.env
+**/.env.*
+!/.env.example
+/data/
+/source/.npmrc
+/source/
+.playwright-cli/

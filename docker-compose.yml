@@ -1,0 +1,25 @@
+name: excalidraw
+
+services:
+  api:
+    build:
+      context: ./api
+    container_name: excalidraw-api
+    restart: unless-stopped
+    user: "1000:1000"
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - ${EXCALIDRAW_DATA_DIR:?Set EXCALIDRAW_DATA_DIR in .env}:/data
+
+  excalidraw:
+    image: excalidraw-home:v0.18.1-subpath
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: excalidraw
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "127.0.0.1:5002:80"

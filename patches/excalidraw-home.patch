@@ -1,0 +1,811 @@
+diff --git a/excalidraw-app/App.tsx b/excalidraw-app/App.tsx
+index 2cb6e77..190aa36 100644
+--- a/excalidraw-app/App.tsx
++++ b/excalidraw-app/App.tsx
+@@ -14,0 +15 @@ import { loadFromBlob } from "@excalidraw/excalidraw/data/blob";
++import { serializeAsJSON } from "@excalidraw/excalidraw/data/json";
+@@ -134,0 +136,34 @@ import { isElementLink } from "@excalidraw/excalidraw/element/elementLink";
++import { exportToCanvas } from "@excalidraw/utils/export";
++import {
++  createServerFile,
++  deleteServerFile,
++  getServerFile,
++  listServerFiles,
++  renameServerFile,
++  saveServerFile,
++  saveServerFileThumbnail,
++} from "./data/serverFiles";
++import type { ServerFileSummary } from "./data/serverFiles";
++import { ServerFilesDialog } from "./components/ServerFilesDialog";
++
++const ACTIVE_SERVER_FILE_KEY = "excalidraw.serverFileId";
++
++const readStoredServerFileId = () => {
++  try {
++    return window.localStorage.getItem(ACTIVE_SERVER_FILE_KEY);
++  } catch {
++    return null;
++  }
++};
++
++const storeActiveServerFileId = (id: string | null) => {
++  try {
++    if (id) {
++      window.localStorage.setItem(ACTIVE_SERVER_FILE_KEY, id);
++    } else {
++      window.localStorage.removeItem(ACTIVE_SERVER_FILE_KEY);
++    }
++  } catch {
++    // Server file access should continue when browser storage is unavailable.
++  }
++};
+@@ -332,0 +368,20 @@ const ExcalidrawWrapper = () => {
++  const [serverFiles, setServerFiles] = useState<ServerFileSummary[]>([]);
++  const [isServerFilesDialogOpen, setIsServerFilesDialogOpen] = useState(false);
++  const [activeServerFile, setActiveServerFile] =
++    useState<ServerFileSummary | null>(null);
++  const [serverSaveStatus, setServerSaveStatus] = useState<
++    "idle" | "saving" | "saved" | "error"
++  >("idle");
++  const activeServerFileRef = useRef<ServerFileSummary | null>(null);
++  const serverFileReadyRef = useRef(false);
++  const serverSaveBlockedRef = useRef(false);
++  const serverSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
++  const pendingServerSaveRef = useRef<{
++    id: string;
++    name: string;
++    scene: string;
++  } | null>(null);
++  const serverSaveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
++    null,
++  );
++  const serverFileThumbnailGenerationRef = useRef(new Set<string>());
+@@ -334,0 +390,56 @@ const ExcalidrawWrapper = () => {
++  const createServerFileThumbnail = async (serializedScene: string) => {
++    try {
++      const scene = JSON.parse(serializedScene);
++      const canvas = await exportToCanvas({
++        elements: scene.elements,
++        appState: { ...scene.appState, exportBackground: true },
++        files: scene.files || {},
++        maxWidthOrHeight: 360,
++        exportPadding: 12,
++      });
++      return canvas.toDataURL("image/png");
++    } catch (error) {
++      console.warn("Unable to create server drawing thumbnail", error);
++      return undefined;
++    }
++  };
++
++  const generateMissingServerFileThumbnails = async (
++    files: ServerFileSummary[],
++  ) => {
++    for (const file of files) {
++      if (
++        file.hasThumbnail ||
++        serverFileThumbnailGenerationRef.current.has(file.id)
++      ) {
++        continue;
++      }
++
++      serverFileThumbnailGenerationRef.current.add(file.id);
++      try {
++        const document = await getServerFile(file.id);
++        const thumbnail = await createServerFileThumbnail(
++          JSON.stringify(document.scene),
++        );
++        if (!thumbnail) {
++          continue;
++        }
++
++        const savedFile = await saveServerFileThumbnail(
++          file.id,
++          document.revision,
++          thumbnail,
++        );
++        setServerFiles((currentFiles) =>
++          currentFiles.map((entry) =>
++            entry.id === savedFile.id ? { ...entry, ...savedFile } : entry,
++          ),
++        );
++      } catch (error) {
++        console.warn("Unable to generate server drawing thumbnail", error);
++      } finally {
++        serverFileThumbnailGenerationRef.current.delete(file.id);
++      }
++    }
++  };
++
+@@ -369,0 +481,220 @@ const ExcalidrawWrapper = () => {
++  const updateActiveServerFile = (file: ServerFileSummary | null) => {
++    activeServerFileRef.current = file;
++    setActiveServerFile(file);
++  };
++
++  const enqueueServerSave = (pending: {
++    id: string;
++    name: string;
++    scene: string;
++  }) => {
++    serverSaveQueueRef.current = serverSaveQueueRef.current.then(async () => {
++      const activeFile = activeServerFileRef.current;
++      if (
++        !serverFileReadyRef.current ||
++        !activeFile ||
++        activeFile.id !== pending.id ||
++        serverSaveBlockedRef.current
++      ) {
++        return;
++      }
++
++      try {
++        setServerSaveStatus("saving");
++        const thumbnail = await createServerFileThumbnail(pending.scene);
++        const savedFile = await saveServerFile(
++          activeFile.id,
++          pending.name,
++          activeFile.revision,
++          pending.scene,
++          thumbnail,
++        );
++        if (activeServerFileRef.current?.id === savedFile.id) {
++          updateActiveServerFile(savedFile);
++          setServerSaveStatus("saved");
++          setServerFiles((files) => [
++            savedFile,
++            ...files.filter((file) => file.id !== savedFile.id),
++          ]);
++        }
++      } catch (error: any) {
++        if (activeServerFileRef.current?.id === pending.id) {
++          setServerSaveStatus("error");
++          if (error.message.includes("changed on another device")) {
++            serverSaveBlockedRef.current = true;
++          }
++          setErrorMessage(error.message);
++        }
++      }
++    });
++    return serverSaveQueueRef.current;
++  };
++
++  const flushServerSave = async () => {
++    if (serverSaveTimeoutRef.current) {
++      clearTimeout(serverSaveTimeoutRef.current);
++      serverSaveTimeoutRef.current = null;
++    }
++    const pending = pendingServerSaveRef.current;
++    pendingServerSaveRef.current = null;
++    if (pending) {
++      enqueueServerSave(pending);
++    }
++    await serverSaveQueueRef.current;
++  };
++
++  const scheduleServerSave = (
++    elements: readonly OrderedExcalidrawElement[],
++    appState: AppState,
++    files: BinaryFiles,
++  ) => {
++    const activeFile = activeServerFileRef.current;
++    if (
++      !serverFileReadyRef.current ||
++      !activeFile ||
++      serverSaveBlockedRef.current
++    ) {
++      return;
++    }
++
++    pendingServerSaveRef.current = {
++      id: activeFile.id,
++      name: activeFile.name,
++      scene: serializeAsJSON(elements, appState, files, "local"),
++    };
++    setServerSaveStatus("saving");
++    if (serverSaveTimeoutRef.current) {
++      clearTimeout(serverSaveTimeoutRef.current);
++    }
++    serverSaveTimeoutRef.current = setTimeout(() => {
++      serverSaveTimeoutRef.current = null;
++      const pending = pendingServerSaveRef.current;
++      pendingServerSaveRef.current = null;
++      if (pending) {
++        enqueueServerSave(pending);
++      }
++    }, 900);
++  };
++
++  const refreshServerFiles = async (showError = true) => {
++    try {
++      setServerFiles(await listServerFiles());
++    } catch (error: any) {
++      console.error(error);
++      if (showError) {
++        setErrorMessage(error.message);
++      }
++    }
++  };
++
++  const openServerFile = async (id: string) => {
++    if (!excalidrawAPI || collabAPI?.isCollaborating()) {
++      return;
++    }
++
++    try {
++      await flushServerSave();
++      serverFileReadyRef.current = false;
++      const file = await getServerFile(id);
++      const restoredScene = await loadFromBlob(
++        new Blob([JSON.stringify(file.scene)], { type: "application/json" }),
++        excalidrawAPI.getAppState(),
++        null,
++      );
++
++      excalidrawAPI.updateScene({
++        elements: restoredScene.elements,
++        appState: { ...restoredScene.appState, isLoading: false },
++        captureUpdate: CaptureUpdateAction.IMMEDIATELY,
++      });
++      if (Object.keys(restoredScene.files).length) {
++        excalidrawAPI.addFiles(Object.values(restoredScene.files));
++      }
++
++      serverSaveBlockedRef.current = false;
++      updateActiveServerFile(file);
++      storeActiveServerFileId(file.id);
++      serverFileReadyRef.current = true;
++      setServerSaveStatus("saved");
++      setServerFiles((files) => [
++        file,
++        ...files.filter((entry) => entry.id !== file.id),
++      ]);
++    } catch (error: any) {
++      serverFileReadyRef.current = true;
++      setServerSaveStatus("error");
++      setErrorMessage(error.message);
++    }
++  };
++
++  const createServerDrawing = async (blank: boolean) => {
++    if (!excalidrawAPI || collabAPI?.isCollaborating()) {
++      return;
++    }
++
++    const name = window.prompt(
++      "Drawing name",
++      blank
++        ? "Untitled drawing"
++        : excalidrawAPI.getAppState().name || "Untitled drawing",
++    );
++    if (!name?.trim()) {
++      return;
++    }
++
++    try {
++      await flushServerSave();
++      const scene = blank
++        ? serializeAsJSON([], getDefaultAppState(), {}, "local")
++        : serializeAsJSON(
++            excalidrawAPI.getSceneElementsIncludingDeleted(),
++            excalidrawAPI.getAppState(),
++            excalidrawAPI.getFiles(),
++            "local",
++          );
++      const thumbnail = await createServerFileThumbnail(scene);
++      const file = await createServerFile(name.trim(), scene, thumbnail);
++      setServerFiles((files) => [
++        file,
++        ...files.filter((entry) => entry.id !== file.id),
++      ]);
++      await openServerFile(file.id);
++    } catch (error: any) {
++      setErrorMessage(error.message);
++    }
++  };
++
++  const renameServerDrawing = async (id: string, name: string) => {
++    try {
++      await flushServerSave();
++      const renamedFile = await renameServerFile(id, name);
++      setServerFiles((files) => [
++        renamedFile,
++        ...files.filter((file) => file.id !== renamedFile.id),
++      ]);
++      if (activeServerFileRef.current?.id === id) {
++        updateActiveServerFile(renamedFile);
++      }
++    } catch (error: any) {
++      setErrorMessage(error.message);
++    }
++  };
++
++  const deleteServerDrawing = async (id: string) => {
++    try {
++      await flushServerSave();
++      await deleteServerFile(id);
++      if (activeServerFileRef.current?.id === id) {
++        serverFileReadyRef.current = false;
++        serverSaveBlockedRef.current = false;
++        pendingServerSaveRef.current = null;
++        updateActiveServerFile(null);
++        storeActiveServerFileId(null);
++        setServerSaveStatus("idle");
++      }
++      setServerFiles((files) => files.filter((file) => file.id !== id));
++    } catch (error: any) {
++      setErrorMessage(error.message);
++    }
++  };
++
+@@ -378,0 +710,9 @@ const ExcalidrawWrapper = () => {
++  useEffect(() => {
++    if (isTestEnv()) {
++      return;
++    }
++    listServerFiles()
++      .then(setServerFiles)
++      .catch((error) => console.warn("Unable to list server drawings", error));
++  }, []);
++
+@@ -465,0 +806 @@ const ExcalidrawWrapper = () => {
++    const hasExternalSceneUrl = window.location.hash.startsWith("#url=");
+@@ -466,0 +808,35 @@ const ExcalidrawWrapper = () => {
++      const storedServerFileId = readStoredServerFileId();
++      if (
++        storedServerFileId &&
++        !hasExternalSceneUrl &&
++        !data.isExternalScene &&
++        !collabAPI?.isCollaborating()
++      ) {
++        try {
++          const file = await getServerFile(storedServerFileId);
++          const localAppState = excalidrawAPI.getAppState();
++          const restoredScene = await loadFromBlob(
++            new Blob([JSON.stringify(file.scene)], {
++              type: "application/json",
++            }),
++            {
++              ...localAppState,
++              ...restoreAppState(data.scene?.appState || null, localAppState),
++            } as AppState,
++            null,
++          );
++          data = { ...data, scene: restoredScene };
++          serverSaveBlockedRef.current = false;
++          updateActiveServerFile(file);
++          setServerSaveStatus("saved");
++          serverFileReadyRef.current = true;
++          setServerFiles((files) => [
++            file,
++            ...files.filter((entry) => entry.id !== file.id),
++          ]);
++        } catch (error: any) {
++          console.error("Unable to restore server drawing", error);
++          setErrorMessage(`Unable to restore server drawing: ${error.message}`);
++          storeActiveServerFileId(null);
++        }
++      }
+@@ -620,0 +997,2 @@ const ExcalidrawWrapper = () => {
++    } else {
++      scheduleServerSave(elements, appState, files);
+@@ -868,0 +1247,11 @@ const ExcalidrawWrapper = () => {
++          serverFiles={serverFiles}
++          activeServerFile={activeServerFile}
++          serverSaveStatus={serverSaveStatus}
++          onCreateServerFile={() => void createServerDrawing(false)}
++          onCreateBlankServerFile={() => void createServerDrawing(true)}
++          onOpenServerFile={(id) => void openServerFile(id)}
++          onRefreshServerFiles={() => void refreshServerFiles()}
++          onManageServerFiles={() => {
++            setIsServerFilesDialogOpen(true);
++            void generateMissingServerFileThumbnails(serverFiles);
++          }}
+@@ -869,0 +1259,13 @@ const ExcalidrawWrapper = () => {
++        {isServerFilesDialogOpen && (
++          <ServerFilesDialog
++            files={serverFiles}
++            activeFileId={activeServerFile?.id || null}
++            onClose={() => setIsServerFilesDialogOpen(false)}
++            onOpen={(id) => {
++              setIsServerFilesDialogOpen(false);
++              void openServerFile(id);
++            }}
++            onRename={(id, name) => void renameServerDrawing(id, name)}
++            onDelete={(id) => void deleteServerDrawing(id)}
++          />
++        )}
+diff --git a/excalidraw-app/components/AppMainMenu.tsx b/excalidraw-app/components/AppMainMenu.tsx
+index cb741cf..82acf20 100644
+--- a/excalidraw-app/components/AppMainMenu.tsx
++++ b/excalidraw-app/components/AppMainMenu.tsx
+@@ -11,0 +12 @@ import { saveDebugState } from "./DebugCanvas";
++import type { ServerFileSummary } from "../data/serverFiles";
+@@ -19,0 +21,8 @@ export const AppMainMenu: React.FC<{
++  serverFiles: ServerFileSummary[];
++  activeServerFile: ServerFileSummary | null;
++  serverSaveStatus: "idle" | "saving" | "saved" | "error";
++  onCreateServerFile: () => void;
++  onCreateBlankServerFile: () => void;
++  onOpenServerFile: (id: string) => void;
++  onRefreshServerFiles: () => void;
++  onManageServerFiles: () => void;
+@@ -24,0 +34,40 @@ export const AppMainMenu: React.FC<{
++      <MainMenu.Separator />
++      <MainMenu.Item onClick={props.onCreateServerFile}>
++        Save current drawing to server...
++      </MainMenu.Item>
++      <MainMenu.Item onClick={props.onCreateBlankServerFile}>
++        New blank server drawing...
++      </MainMenu.Item>
++      {props.activeServerFile && (
++        <MainMenu.Item disabled>
++          Server: {props.activeServerFile.name} (
++          {props.serverSaveStatus === "saving"
++            ? "Saving..."
++            : props.serverSaveStatus === "error"
++            ? "Save error"
++            : "Saved"}
++          )
++        </MainMenu.Item>
++      )}
++      <MainMenu.Group title="Recent drawings">
++        {props.serverFiles.slice(0, 5).map((file) => (
++          <MainMenu.Item
++            key={file.id}
++            disabled={
++              file.id === props.activeServerFile?.id &&
++              props.serverSaveStatus !== "error"
++            }
++            onClick={() => props.onOpenServerFile(file.id)}
++          >
++            {file.id === props.activeServerFile?.id ? "✓ " : ""}
++            {file.name}
++          </MainMenu.Item>
++        ))}
++        <MainMenu.Item onClick={props.onRefreshServerFiles}>
++          Refresh server drawings
++        </MainMenu.Item>
++      </MainMenu.Group>
++      <MainMenu.Item onClick={props.onManageServerFiles}>
++        View all drawings...
++      </MainMenu.Item>
++      <MainMenu.Separator />
+diff --git a/excalidraw-app/components/ServerFilesDialog.scss b/excalidraw-app/components/ServerFilesDialog.scss
+new file mode 100644
+index 0000000..765ae1e
+--- /dev/null
++++ b/excalidraw-app/components/ServerFilesDialog.scss
+@@ -0,0 +1,104 @@
++.server-files-dialog {
++  display: flex;
++  flex-direction: column;
++  gap: 1rem;
++}
++
++.server-files-dialog__search {
++  width: 100%;
++  box-sizing: border-box;
++  padding: 0.65rem 0.75rem;
++  border: 1px solid var(--color-surface-high);
++  border-radius: 0.5rem;
++  background: var(--island-bg-color);
++  color: var(--color-on-surface);
++  font: inherit;
++}
++
++.server-files-dialog__grid {
++  display: grid;
++  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
++  gap: 0.75rem;
++  max-height: min(65vh, 680px);
++  overflow: auto;
++  padding: 1px;
++}
++
++.server-files-dialog__card {
++  min-width: 0;
++  overflow: hidden;
++  border: 1px solid var(--color-surface-high);
++  border-radius: 0.5rem;
++  background: var(--island-bg-color);
++}
++
++.server-files-dialog__preview {
++  display: flex;
++  width: 100%;
++  aspect-ratio: 16 / 10;
++  align-items: center;
++  justify-content: center;
++  overflow: hidden;
++  border: 0;
++  background: var(--color-surface-mid);
++  color: var(--color-on-surface);
++  cursor: pointer;
++}
++
++.server-files-dialog__preview img {
++  width: 100%;
++  height: 100%;
++  object-fit: contain;
++}
++
++.server-files-dialog__details {
++  display: flex;
++  min-width: 0;
++  flex-direction: column;
++  gap: 0.3rem;
++  padding: 0.65rem 0.75rem 0;
++}
++
++.server-files-dialog__details strong {
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.server-files-dialog__details span {
++  color: var(--color-on-surface);
++  font-size: 0.75rem;
++  opacity: 0.72;
++}
++
++.server-files-dialog__actions {
++  display: flex;
++  gap: 0.25rem;
++  padding: 0.5rem;
++}
++
++.server-files-dialog__actions button {
++  flex: 1;
++  padding: 0.4rem 0.25rem;
++  border: 0;
++  border-radius: 0.35rem;
++  background: transparent;
++  color: var(--color-on-surface);
++  cursor: pointer;
++  font: inherit;
++  font-size: 0.8rem;
++}
++
++.server-files-dialog__actions button:hover {
++  background: var(--color-surface-mid);
++}
++
++.server-files-dialog__actions .server-files-dialog__delete {
++  color: var(--color-danger);
++}
++
++.server-files-dialog__empty {
++  padding: 2rem 1rem;
++  text-align: center;
++  opacity: 0.75;
++}
+diff --git a/excalidraw-app/components/ServerFilesDialog.tsx b/excalidraw-app/components/ServerFilesDialog.tsx
+new file mode 100644
+index 0000000..c873516
+--- /dev/null
++++ b/excalidraw-app/components/ServerFilesDialog.tsx
+@@ -0,0 +1,112 @@
++import { useMemo, useState } from "react";
++import { Dialog } from "@excalidraw/excalidraw/components/Dialog";
++import {
++  getServerFileThumbnailUrl,
++  type ServerFileSummary,
++} from "../data/serverFiles";
++
++import "./ServerFilesDialog.scss";
++
++export const ServerFilesDialog = (props: {
++  files: ServerFileSummary[];
++  activeFileId: string | null;
++  onClose: () => void;
++  onOpen: (id: string) => void;
++  onRename: (id: string, name: string) => void;
++  onDelete: (id: string) => void;
++}) => {
++  const [query, setQuery] = useState("");
++  const filteredFiles = useMemo(() => {
++    const normalizedQuery = query.trim().toLocaleLowerCase();
++    return props.files.filter((file) =>
++      file.name.toLocaleLowerCase().includes(normalizedQuery),
++    );
++  }, [props.files, query]);
++
++  return (
++    <Dialog
++      size="wide"
++      title="All server drawings"
++      onCloseRequest={props.onClose}
++    >
++      <div className="server-files-dialog">
++        <input
++          className="server-files-dialog__search"
++          type="search"
++          value={query}
++          onChange={(event) => setQuery(event.target.value)}
++          placeholder="Search drawings"
++          aria-label="Search drawings"
++        />
++        {filteredFiles.length ? (
++          <div className="server-files-dialog__grid">
++            {filteredFiles.map((file) => (
++              <article className="server-files-dialog__card" key={file.id}>
++                <button
++                  className="server-files-dialog__preview"
++                  type="button"
++                  onClick={() => props.onOpen(file.id)}
++                  aria-label={`Open ${file.name}`}
++                >
++                  {file.hasThumbnail ? (
++                    <img
++                      src={getServerFileThumbnailUrl(file.id)}
++                      alt=""
++                      loading="lazy"
++                    />
++                  ) : (
++                    <span>No preview</span>
++                  )}
++                </button>
++                <div className="server-files-dialog__details">
++                  <strong title={file.name}>{file.name}</strong>
++                  <span>
++                    {file.id === props.activeFileId ? "Open · " : ""}
++                    {new Date(file.updatedAt).toLocaleString()}
++                  </span>
++                </div>
++                <div className="server-files-dialog__actions">
++                  <button type="button" onClick={() => props.onOpen(file.id)}>
++                    Open
++                  </button>
++                  <button
++                    type="button"
++                    onClick={() => {
++                      const name = window.prompt("Rename drawing", file.name);
++                      if (name?.trim() && name.trim() !== file.name) {
++                        props.onRename(file.id, name.trim());
++                      }
++                    }}
++                  >
++                    Rename
++                  </button>
++                  <button
++                    className="server-files-dialog__delete"
++                    type="button"
++                    onClick={() => {
++                      if (
++                        window.confirm(
++                          `Delete “${file.name}”? This cannot be undone.`,
++                        )
++                      ) {
++                        props.onDelete(file.id);
++                      }
++                    }}
++                  >
++                    Delete
++                  </button>
++                </div>
++              </article>
++            ))}
++          </div>
++        ) : (
++          <p className="server-files-dialog__empty">
++            {props.files.length
++              ? "No drawings match your search."
++              : "No server drawings yet."}
++          </p>
++        )}
++      </div>
++    </Dialog>
++  );
++};
+diff --git a/excalidraw-app/data/serverFiles.ts b/excalidraw-app/data/serverFiles.ts
+new file mode 100644
+index 0000000..087b874
+--- /dev/null
++++ b/excalidraw-app/data/serverFiles.ts
+@@ -0,0 +1,89 @@
++export type ServerFileSummary = {
++  id: string;
++  name: string;
++  revision: number;
++  updatedAt: string;
++  hasThumbnail?: boolean;
++};
++
++export type ServerFileDocument = ServerFileSummary & {
++  scene: Record<string, unknown>;
++};
++
++const SERVER_FILES_API = `${import.meta.env.BASE_URL}api/files`;
++
++const request = async <T>(url: string, init?: RequestInit): Promise<T> => {
++  const response = await fetch(url, {
++    ...init,
++    headers: {
++      "Content-Type": "application/json",
++      ...init?.headers,
++    },
++  });
++  const data = await response.json();
++  if (!response.ok) {
++    throw new Error(data.error || `Server returned ${response.status}`);
++  }
++  return data as T;
++};
++
++export const listServerFiles = () =>
++  request<ServerFileSummary[]>(SERVER_FILES_API);
++
++export const getServerFile = (id: string) =>
++  request<ServerFileDocument>(`${SERVER_FILES_API}/${encodeURIComponent(id)}`);
++
++export const getServerFileThumbnailUrl = (id: string) =>
++  `${SERVER_FILES_API}/${encodeURIComponent(id)}/thumbnail`;
++
++export const saveServerFileThumbnail = (
++  id: string,
++  revision: number,
++  thumbnail: string,
++) =>
++  request<ServerFileSummary>(getServerFileThumbnailUrl(id), {
++    method: "PUT",
++    body: JSON.stringify({ revision, thumbnail }),
++  });
++
++export const createServerFile = (
++  name: string,
++  serializedScene: string,
++  thumbnail?: string,
++) =>
++  request<ServerFileSummary>(SERVER_FILES_API, {
++    method: "POST",
++    body: JSON.stringify({
++      name,
++      scene: JSON.parse(serializedScene),
++      thumbnail,
++    }),
++  });
++
++export const saveServerFile = (
++  id: string,
++  name: string,
++  revision: number,
++  serializedScene: string,
++  thumbnail?: string,
++) =>
++  request<ServerFileSummary>(`${SERVER_FILES_API}/${encodeURIComponent(id)}`, {
++    method: "PUT",
++    body: JSON.stringify({
++      name,
++      revision,
++      scene: JSON.parse(serializedScene),
++      thumbnail,
++    }),
++  });
++
++export const renameServerFile = (id: string, name: string) =>
++  request<ServerFileSummary>(`${SERVER_FILES_API}/${encodeURIComponent(id)}`, {
++    method: "PATCH",
++    body: JSON.stringify({ name }),
++  });
++
++export const deleteServerFile = (id: string) =>
++  request<{ id: string }>(`${SERVER_FILES_API}/${encodeURIComponent(id)}`, {
++    method: "DELETE",
++  });
+diff --git a/excalidraw-app/vite.config.mts b/excalidraw-app/vite.config.mts
+index 57a4d19..60e30c2 100644
+--- a/excalidraw-app/vite.config.mts
++++ b/excalidraw-app/vite.config.mts
+@@ -15,0 +16 @@ export default defineConfig(({ mode }) => {
++    base: "/excalidraw/",
+@@ -199 +200 @@ export default defineConfig(({ mode }) => {
+-          start_url: "/",
++          start_url: "/excalidraw/",
+@@ -206 +207 @@ export default defineConfig(({ mode }) => {
+-              action: "/",
++              action: "/excalidraw/",
+@@ -213 +214 @@ export default defineConfig(({ mode }) => {
+-            action: "/web-share-target",
++            action: "/excalidraw/web-share-target",
