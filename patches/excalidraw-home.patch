@@ -433,23 +433,23 @@ index cb741cf..82acf20 100644
 @@ -24,0 +34,40 @@ export const AppMainMenu: React.FC<{
 +      <MainMenu.Separator />
 +      <MainMenu.Item onClick={props.onCreateServerFile}>
-+        Save current drawing to server...
++        💾 Save current drawing to server...
 +      </MainMenu.Item>
 +      <MainMenu.Item onClick={props.onCreateBlankServerFile}>
-+        New blank server drawing...
++        🆕 New blank server drawing...
 +      </MainMenu.Item>
 +      {props.activeServerFile && (
 +        <MainMenu.Item disabled>
-+          Server: {props.activeServerFile.name} (
++          ☁️ Server: {props.activeServerFile.name} (
 +          {props.serverSaveStatus === "saving"
-+            ? "Saving..."
++            ? "⏳ Saving..."
 +            : props.serverSaveStatus === "error"
-+            ? "Save error"
-+            : "Saved"}
++            ? "⚠️ Save error"
++            : "✅ Saved"}
 +          )
 +        </MainMenu.Item>
 +      )}
-+      <MainMenu.Group title="Recent drawings">
++      <MainMenu.Group title="🕘 Recent drawings">
 +        {props.serverFiles.slice(0, 5).map((file) => (
 +          <MainMenu.Item
 +            key={file.id}
@@ -459,16 +459,16 @@ index cb741cf..82acf20 100644
 +            }
 +            onClick={() => props.onOpenServerFile(file.id)}
 +          >
-+            {file.id === props.activeServerFile?.id ? "✓ " : ""}
++            {"📄 "}{file.id === props.activeServerFile?.id ? "✓ " : ""}
 +            {file.name}
 +          </MainMenu.Item>
 +        ))}
 +        <MainMenu.Item onClick={props.onRefreshServerFiles}>
-+          Refresh server drawings
++          🔄 Refresh server drawings
 +        </MainMenu.Item>
 +      </MainMenu.Group>
 +      <MainMenu.Item onClick={props.onManageServerFiles}>
-+        View all drawings...
++        📚 View all drawings...
 +      </MainMenu.Item>
 +      <MainMenu.Separator />
 diff --git a/excalidraw-app/components/ServerFilesDialog.scss b/excalidraw-app/components/ServerFilesDialog.scss
